@@ -36,7 +36,7 @@ main :: () {
     // Name = address family + host address + port number
     // Client applications use the IP address and port to connect to the host network.
     
-    // Bind the listening socket using theinformation in the sockaddr structure
+    // Bind the listening socket using theinformation in the sockaddr structure
     r := bind(listen_socket, result.ai_addr, xx result.ai_addrlen);
     if r < 0 {
         print("bind failed \n");
@@ -65,46 +65,128 @@ main :: () {
         
         // Read & Write
         recvbuf : [DEFAULT_BUFLEN]u8;
-        read: int;
-        c := true;
-        while c {
-            read = recv(client_socket, recvbuf.data, xx recvbuf.count, 0);
-            if read > 0 {
-                print("bytes received: %\n", read);
-                str: string;
-                str.data = recvbuf.data;
-                str.count = read;
-                
-                reply := "OK";
+        read := recv(client_socket, recvbuf.data, xx recvbuf.count, 0);
+
+        if read > 0 {
+            str: string;
+            str.data = recvbuf.data;
+            str.count = read;
+            
+            ok, res := parse_http_request(str);
+            if !ok {
+                print("wrong request format\n");
+                reply := "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nAge: 30\r\n\r\nWrong request format!";
                 write := send(client_socket, reply.data, xx reply.count, 0);
-                if write == SOCKET_ERROR {
-                    print("send failed %\n", WSAGetLastError());
-                    closesocket(client_socket);
-                    return;
-                }
-                print("bytes sent %\n", write);
-            } else if read == 0 {
-                print("Connection closing.. \n");
-                c = false;
-            } else {
-                print("recv failed %\n", WSAGetLastError());
-                closesocket(listen_socket);
-                return;
+                closesocket(client_socket);
+                continue;
             }
+            
+            reply := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
+            if res != "" {
+                reply = tprint("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%", res);
+            }
+            write := send(client_socket, reply.data, xx reply.count, 0);
+            if write == SOCKET_ERROR {
+                print("send failed %\n", WSAGetLastError());
+            }
+        } else if read == 0 {
+            print("Connection closing.. \n");
+        } else {
+            print("recv failed %\n", WSAGetLastError());
         }
+        closesocket(client_socket);
     }
-    
+        
     // Close
     closesocket(listen_socket);
     
 }
 
-parse_http_request :: (request: string) {
+parse_http_request :: (request: string) -> bool, string {
+    ok, method, right := split_from_left(request, " ");
+    if method != "POST" return false, "";
     
+    left: string;
+    ok, left, right = split_from_left(request, "Content-Type: ");
+    content_type, instruction: string;
+    ok, content_type, right = split_from_left(right, "\n");
+    if trim(content_type) != "text/plain" {
+        print("wrong content type\n");
+        return false, "";
+    }
+    
+    ok, left, right = split_from_left(right, "\r\n\r\n");
+    content := trim(right);
+    
+    ok, instruction, right = split_from_left(content, " ");
+    if instruction == {
+        case "set";
+            k_v := split(right, " ");
+            if k_v.count != 2 return false, "";
+            table_set(*data_table, copy_string(k_v[0]), copy_string(k_v[1]));
+            return true, "";
+        case "get";
+            k_v := split(right, " ");
+            if k_v.count != 1 return false, "";
+            value, ok := table_find(*data_table, k_v[0]);
+            if !ok value = "no value";
+            return true, value;
+    }
+    return false, "";
 }
 
+data_table: Table(string, string);
+
 DEFAULT_PORT :: "27015";
-DEFAULT_BUFLEN :: 512;
+DEFAULT_BUFLEN :: 1024;
 
 #import "Basic";
 #import "Socket";
+#import "String";
+#import "Hash_Table";
+
+
+
+
+// Multiple clients
+
+ // client_sockets: [MAX_CLIENTS]s32;
+ //    read_set: fd_set;
+    
+ //    // Initialize all client socket to 0 so not checked
+ //    for client: client_sockets client = 0;
+ //    max_sd: s32;
+    
+ //    while true {
+ //        // clear the socket set
+ //        for fd: read_set.fd_array fd = 0;
+ //        read_set.fd_count = 0;
+        
+ //        // add master socket to set
+ //        read_set.fd_array[read_set.fd_count] = listen_socket;
+ //        read_set.fd_count += 1;
+ //        max_sd = xx listen_socket;
+        
+ //        for client: client_sockets {
+ //            sd := client;
+            
+ //            //if valid socket descriptor then add to read list 
+ //            if sd > 0 read_set.fd_array[read_set.fd_count] = xx client;
+ //            read_set.fd_count += 1;
+            
+ //            //highest file descriptor number, need it for the select function 
+ //            if sd > max_sd then max_sd = sd;
+ //        }
+        
+ //        for r: read_set.fd_array {print("%\n", r);}
+        
+ //        // wait for an activity on one of the sockets , timeout is NULL ,so wait indefinitely 
+ //        socket_count := select(max_sd + 1, *read_set, null, null, null);
+ //        print("Activity %\n", activity);
+ //        if socket_count == SOCKET_ERROR {
+ //            print("select failed with error \n");
+ //        }
+        
+ //        //If something happened on the master socket, then its an incoming connection 
+        
+ //    }
