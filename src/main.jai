@@ -1,4 +1,13 @@
 main :: () {
+    // create file
+    success: bool;
+    file_name := "C:/Users/olya/projects/data_storage/file1.kv";
+    file, success =  file_open(file_name, for_writing=true, keep_existing_content=true);
+    if !success {
+        print("Could not open key-value storage file\n");
+        return;
+    }
+    
     wsa_data : WSAData;
     
     b1: u8 = 0x2;
@@ -45,7 +54,6 @@ main :: () {
         return;
     }
     
-
     // Listen
     if listen(listen_socket, SOMAXCONN) == SOCKET_ERROR {
         print("listen failed with error: ", WSAGetLastError());
@@ -84,6 +92,7 @@ main :: () {
             reply := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
             if res != "" {
                 reply = tprint("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%", res);
+                free(res);
             }
             write := send(client_socket, reply.data, xx reply.count, 0);
             if write == SOCKET_ERROR {
@@ -99,7 +108,7 @@ main :: () {
         
     // Close
     closesocket(listen_socket);
-    
+    file_close(*file);
 }
 
 parse_http_request :: (request: string) -> bool, string {
@@ -108,6 +117,10 @@ parse_http_request :: (request: string) -> bool, string {
     
     left: string;
     ok, left, right = split_from_left(request, "Content-Type: ");
+    if !ok {
+        print("content type missed\n");
+        return false, "";
+    }
     content_type, instruction: string;
     ok, content_type, right = split_from_left(right, "\n");
     if trim(content_type) != "text/plain" {
@@ -119,23 +132,56 @@ parse_http_request :: (request: string) -> bool, string {
     content := trim(right);
     
     ok, instruction, right = split_from_left(content, " ");
+    success : bool;
     if instruction == {
+    
         case "set";
             k_v := split(right, " ");
             if k_v.count != 2 return false, "";
-            table_set(*data_table, copy_string(k_v[0]), copy_string(k_v[1]));
+            
+            // write to key_value storage file
+            data := tprint("'%':%;", k_v[0], k_v[1]);
+            advance :=  file_length(file);
+            file_set_position(file, advance);
+            success =  file_write(*file, data);
+            if !success {
+                print("Could not write to key-value storage file.\n");
+                return false, "";
+            }
+            offset: [2]u32;
+            offset[0] = xx (advance + k_v[0].count + 3);
+            offset[1] = xx k_v[1].count;
+            table_set(*indexes, copy_string(k_v[0]), offset);
             return true, "";
-        case "get";
+            
+        case "get";                                
             k_v := split(right, " ");
             if k_v.count != 1 return false, "";
-            value, ok := table_find(*data_table, k_v[0]);
-            if !ok value = "no value";
+            
+            offset: [2]u32;
+            offset, ok = table_find(*indexes, k_v[0]);
+            advance, length := offset[0], offset[1];
+            if !ok return true, "no value";
+            
+            buffer := cast(*u8) alloc(length);
+            value : string;
+            value.count = length;
+            value.data = buffer;
+            
+            file_set_position(file, advance);
+            success =  file_read(file, buffer, length);
+            if !success {
+                print("Could not read from key-value storage file.\n");
+                return false, "";
+            }
+            
             return true, value;
     }
     return false, "";
 }
 
-data_table: Table(string, string);
+indexes: Table(string, [2]u32);
+file: File;
 
 DEFAULT_PORT :: "27015";
 DEFAULT_BUFLEN :: 1024;
@@ -144,6 +190,7 @@ DEFAULT_BUFLEN :: 1024;
 #import "Socket";
 #import "String";
 #import "Hash_Table";
+#import "File";
 
 
 
