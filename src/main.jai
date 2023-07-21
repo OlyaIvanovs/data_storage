@@ -1,12 +1,33 @@
 main :: () {
-    // create file
+    dir := path_strip_filename(get_path_of_running_executable());
+    logs_dir = sprint("%logs", dir);
+    dir_existed := file_exists(logs_dir);
+    
+    make_directory_if_it_does_not_exist(logs_dir);
+    timestamp := to_nanoseconds(current_time_consensus());
+    if !dir_existed then write_entire_file(tprint("%/%.kv", logs_dir, timestamp), "");
+    
+    update_logs_list();
+    
+    // Load data from logs to hash table
+    for log: logs_list {
+        file_path, success := compaction_file(log.name, load=true);
+        if !success return;
+    }
+    update_logs_list();
+    
+    // Merge segments !
+    if log_list
+    
+    file_path := logs_list[logs_list.count - 1].name; // the newest
+    print("file_path to write %\n", file_path);
     success: bool;
-    file_name := "C:/Users/olya/projects/data_storage/file1.kv";
-    file, success =  file_open(file_name, for_writing=true, keep_existing_content=true);
+    file, success =  file_open(file_path, for_writing=true, keep_existing_content=true);
     if !success {
         print("Could not open key-value storage file\n");
         return;
     }
+    // defer file_close(*file);
     
     wsa_data : WSAData;
     
@@ -83,7 +104,7 @@ main :: () {
             ok, res := parse_http_request(str);
             if !ok {
                 print("wrong request format\n");
-                reply := "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nAge: 30\r\n\r\nWrong request format!";
+                reply := tprint("HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n\r\n%", res);
                 write := send(client_socket, reply.data, xx reply.count, 0);
                 closesocket(client_socket);
                 continue;
@@ -92,7 +113,6 @@ main :: () {
             reply := "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n";
             if res != "" {
                 reply = tprint("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\n%", res);
-                free(res);
             }
             write := send(client_socket, reply.data, xx reply.count, 0);
             if write == SOCKET_ERROR {
@@ -104,84 +124,169 @@ main :: () {
             print("recv failed %\n", WSAGetLastError());
         }
         closesocket(client_socket);
+        
+        // Check if main file is too big Add thread for that
+        file_modified_time,file_size, ok := file_modtime_and_size(file_path); 
+        if file_size > 32 {
+            print("new file\n");
+            // close overloaded file ?
+            timestamp := to_nanoseconds(current_time_consensus());
+            file_path = sprint("%/%.kv", logs_dir, timestamp);
+            file, success = file_open(file_path, for_writing=true, keep_existing_content=true);
+            if !success {
+                print("Could not open key-value storage file\n");
+                return;
+            }
+        }
     }
         
     // Close
     closesocket(listen_socket);
-    file_close(*file);
 }
 
-parse_http_request :: (request: string) -> bool, string {
+update_logs_list :: () {
+    array_reset_keeping_memory(*logs_list);
+    
+    maybe_add_to_logs_list :: (file: *File_Visit_Info, userdata: *void) {
+        log := Log.{name=copy_string(file.full_name), modification_time=file.modification_time};
+        array_add(*logs_list, log);
+    }
+    visit_files(logs_dir, recursive = false, null, maybe_add_to_logs_list, visit_directories = false);
+    
+     // Sort log files by modified time
+    compare_file_modification_time :: (log1: Log, log2: Log) -> s64 {
+        if log1.modification_time > log2.modification_time return 1;
+        if log2.modification_time > log1.modification_time return -1;
+        return 0;
+    }
+    quick_sort(logs_list, compare_file_modification_time);
+}
+
+compaction_file :: (file_path: string, load: bool = false) -> (string, bool) {
+    data: Table(string, string);
+    file_contents_str, ok := read_entire_file(file_path);
+    print("file_contents_str %\n", file_contents_str);
+    if ok {
+        k_v_list := split(file_contents_str, ";");
+        for k_v: k_v_list {
+            ok, key, value := split_from_left(k_v, ":");
+            table_set(*data, copy_string(key), copy_string(value));
+        }
+    }
+    
+    // create new file
+    timestamp := to_nanoseconds(current_time_consensus());
+    new_file_path := sprint("%/%.kv", logs_dir, timestamp);
+    new_file, success :=  file_open(new_file_path, for_writing=true, keep_existing_content=true);
+    if !success {
+        print("Could not open key-value storage file\n");
+        return "", false;
+    }
+    
+    // write to new file & load to hash_table
+    for line: data.entries {
+        if line.key == "" continue;
+        if load load_to_hash_table(line.key, line.value, file_length(new_file));
+        ok := write_key_value_pair_to_file(line.key, line.value, new_file);
+        if !ok return "", false;
+    }
+    
+    file_close(*file);
+    file_close(*new_file);
+    file_delete(file_path);
+    
+    // update_log_lists
+    
+    return new_file_path, true;
+}
+
+parse_http_request :: (request: string) -> (bool, string) {
     ok, method, right := split_from_left(request, " ");
-    if method != "POST" return false, "";
+    if method != "POST" return false, "Wrond method. Should be POST.";
     
     left: string;
     ok, left, right = split_from_left(request, "Content-Type: ");
-    if !ok {
-        print("content type missed\n");
-        return false, "";
-    }
+    if !ok return false, "Content type missed";
     content_type, instruction: string;
     ok, content_type, right = split_from_left(right, "\n");
-    if trim(content_type) != "text/plain" {
-        print("wrong content type\n");
-        return false, "";
-    }
-    
+    if trim(content_type) != "text/plain" return false, "Wrong content type";
     ok, left, right = split_from_left(right, "\r\n\r\n");
     content := trim(right);
     
     ok, instruction, right = split_from_left(content, " ");
-    success : bool;
     if instruction == {
     
         case "set";
             k_v := split(right, " ");
-            if k_v.count != 2 return false, "";
-            
-            // write to key_value storage file
-            data := tprint("'%':%;", k_v[0], k_v[1]);
-            advance :=  file_length(file);
-            file_set_position(file, advance);
-            success =  file_write(*file, data);
-            if !success {
-                print("Could not write to key-value storage file.\n");
-                return false, "";
-            }
-            offset: [2]u32;
-            offset[0] = xx (advance + k_v[0].count + 3);
-            offset[1] = xx k_v[1].count;
-            table_set(*indexes, copy_string(k_v[0]), offset);
-            return true, "";
+            if k_v.count != 2 return false, "Incorrect request format. Please use the format 'set KEY VALUE'.";
+            ok, value := handle_set(k_v[0], k_v[1]);
+            return ok, value;
             
         case "get";                                
             k_v := split(right, " ");
-            if k_v.count != 1 return false, "";
-            
-            offset: [2]u32;
-            offset, ok = table_find(*indexes, k_v[0]);
-            advance, length := offset[0], offset[1];
-            if !ok return true, "no value";
-            
-            buffer := cast(*u8) alloc(length);
-            value : string;
-            value.count = length;
-            value.data = buffer;
-            
-            file_set_position(file, advance);
-            success =  file_read(file, buffer, length);
-            if !success {
-                print("Could not read from key-value storage file.\n");
-                return false, "";
-            }
-            
-            return true, value;
+            if k_v.count != 1 return false, "Incorrect request format. Please use the format 'get KEY'.";
+            ok, value := handle_get(k_v[0]);
+            return ok, value;
     }
     return false, "";
 }
 
+write_key_value_pair_to_file :: (key: string, value: string, file: File) -> bool{
+    data := tprint("%:%;", key, value);
+    advance :=  file_length(file);
+    file_set_position(file, advance);
+    success :=  file_write(*file, data);
+    if !success {
+        print("Could not write to key-value storage file.\n");
+        return false;
+    }
+    return true;
+}
+
+load_to_hash_table :: (key: string, value: string, advance: s64) {
+    offset := xx(advance + key.count + 1);
+    
+    offset_info: [2]u32;
+    offset_info[0] = xx offset;
+    offset_info[1] = xx value.count;
+    table_set(*indexes, copy_string(key), offset_info);
+}
+
+handle_set :: (key: string, value: string) -> (bool, string) {
+    load_to_hash_table(key, value, file_length(file));
+    ok := write_key_value_pair_to_file(key, value, file);
+    if !ok return false, "";
+    return true, "";
+}
+
+handle_get :: (key: string) -> (bool, string) {
+    offset, ok := table_find(*indexes, key);
+    advance, length := offset[0], offset[1];
+    value := "no value";
+    if !ok return true, value;
+    
+    buffer := cast(*u8) alloc(length); // Free!
+    value.count = length;
+    value.data = buffer;
+        
+    file_set_position(file, advance);
+    success :=  file_read(file, buffer, length);
+    if !success {
+        print("Could not read from key-value storage file.\n");
+        return false, "";
+    }
+    return true, value;
+}
+
 indexes: Table(string, [2]u32);
 file: File;
+
+logs_list: [..]Log;
+logs_dir : string;
+Log :: struct {
+    name: string;
+    modification_time: Apollo_Time;
+}
 
 DEFAULT_PORT :: "27015";
 DEFAULT_BUFLEN :: 1024;
@@ -191,6 +296,9 @@ DEFAULT_BUFLEN :: 1024;
 #import "String";
 #import "Hash_Table";
 #import "File";
+#import "File_Utilities";
+#import "System";
+#import "Sort";
 
 
 
