@@ -1,4 +1,6 @@
 main :: () {
+    success: bool;
+    
     dir := path_strip_filename(get_path_of_running_executable());
     logs_dir = sprint("%logs", dir);
     dir_existed := file_exists(logs_dir);
@@ -8,26 +10,24 @@ main :: () {
     if !dir_existed then write_entire_file(tprint("%/%.kv", logs_dir, timestamp), "");
     
     update_logs_list();
-    
     // Load data from logs to hash table
-    for log: logs_list {
-        file_path, success := compaction_file(log.name, load=true);
+    for 0..logs_list.count-1 {
+        success = compaction_file(*logs_list[it], load=true);
         if !success return;
     }
     update_logs_list();
     
     // Merge segments !
-    if log_list
+    // if log_list.count > 2 {
+    //     merged_file := merge_segments(log_list[0], log_list[1]);
+    // }
     
-    file_path := logs_list[logs_list.count - 1].name; // the newest
-    print("file_path to write %\n", file_path);
-    success: bool;
-    file, success =  file_open(file_path, for_writing=true, keep_existing_content=true);
+    current_log = logs_list.count - 1; // the newest
+    logs_list[current_log].file, success = file_open(logs_list[current_log].name, for_writing=true, keep_existing_content=true);
     if !success {
         print("Could not open key-value storage file\n");
         return;
     }
-    // defer file_close(*file);
     
     wsa_data : WSAData;
     
@@ -126,17 +126,15 @@ main :: () {
         closesocket(client_socket);
         
         // Check if main file is too big Add thread for that
-        file_modified_time,file_size, ok := file_modtime_and_size(file_path); 
-        if file_size > 32 {
+        file_modified_time,file_size, ok := file_modtime_and_size(logs_list[current_log].name); 
+        if file_size > SEGMENT_SIZE {
             print("new file\n");
-            // close overloaded file ?
-            timestamp := to_nanoseconds(current_time_consensus());
-            file_path = sprint("%/%.kv", logs_dir, timestamp);
-            file, success = file_open(file_path, for_writing=true, keep_existing_content=true);
+            current_log, success = create_new_log();
             if !success {
-                print("Could not open key-value storage file\n");
+                print("error creating file\n");
                 return;
             }
+            // close overloaded file ?
         }
     }
         
@@ -144,11 +142,62 @@ main :: () {
     closesocket(listen_socket);
 }
 
+create_new_log :: () -> (int, bool) {
+    log: Log;
+    success: bool;
+    log.modification_time = current_time_consensus();
+    timestamp := to_nanoseconds(log.modification_time);
+    log.name = sprint("%/%.kv", logs_dir, timestamp);
+    log.file, success = file_open(log.name, for_writing=true, keep_existing_content=true);
+    if !success {
+        print("Could not open key-value storage file\n");
+        return -1, false;
+    }
+   array_add(*logs_list, log);
+   return logs_list.count-1, true;
+}
+
+merge_segments :: (file_path_1: string, file_path_2: string) -> (string, bool) {
+    data: Table(string, string);
+    
+    upload_to_data_table :: (file_path: string, data: Table) -> bool {
+        file_contents_str, ok := read_entire_file(file_path);
+        print("file_contents_str %\n", file_contents_str);
+        if !ok return false;
+        
+        k_v_list := split(file_contents_str, ";");
+        for k_v: k_v_list {
+            ok, key, value := split_from_left(k_v, ":");
+            table_set(*data, copy_string(key), copy_string(value));
+        }
+        
+        return true;
+    } 
+    
+    upload_to_data_table(file_path_1, data);
+    upload_to_data_table(file_path_2, data);
+    
+    timestamp := to_nanoseconds(current_time_consensus());
+    new_file_path := sprint("%/%.kv", logs_dir, timestamp);
+    new_file, success :=  file_open(new_file_path, for_writing=true, keep_existing_content=true);
+    if !success {
+        print("Could not open key-value storage file\n");
+        return "", false;
+    } 
+    return new_file_path, true;
+}
+
 update_logs_list :: () {
     array_reset_keeping_memory(*logs_list);
     
-    maybe_add_to_logs_list :: (file: *File_Visit_Info, userdata: *void) {
-        log := Log.{name=copy_string(file.full_name), modification_time=file.modification_time};
+    maybe_add_to_logs_list :: (file_info: *File_Visit_Info, userdata: *void) {
+        file, success := file_open(file_info.full_name);
+        if !success {
+            print("Could not open new key-value storage file %\n", file_info.full_name);
+            return;
+        }
+        file_close(*file);
+        log := Log.{name=copy_string(file_info.full_name), modification_time=file_info.modification_time, file=file};
         array_add(*logs_list, log);
     }
     visit_files(logs_dir, recursive = false, null, maybe_add_to_logs_list, visit_directories = false);
@@ -162,42 +211,39 @@ update_logs_list :: () {
     quick_sort(logs_list, compare_file_modification_time);
 }
 
-compaction_file :: (file_path: string, load: bool = false) -> (string, bool) {
+compaction_file :: (log: *Log, load: bool = false) -> bool {
     data: Table(string, string);
+    file_path := log.name;
     file_contents_str, ok := read_entire_file(file_path);
-    print("file_contents_str %\n", file_contents_str);
-    if ok {
-        k_v_list := split(file_contents_str, ";");
-        for k_v: k_v_list {
-            ok, key, value := split_from_left(k_v, ":");
-            table_set(*data, copy_string(key), copy_string(value));
-        }
+    if !ok return  false;
+    
+    k_v_list := split(file_contents_str, ";");
+    for k_v: k_v_list {
+        ok, key, value := split_from_left(k_v, ":");
+        table_set(*data, copy_string(key), copy_string(value));
     }
     
-    // create new file
-    timestamp := to_nanoseconds(current_time_consensus());
-    new_file_path := sprint("%/%.kv", logs_dir, timestamp);
-    new_file, success :=  file_open(new_file_path, for_writing=true, keep_existing_content=true);
+    new_log_index, success := create_new_log();
     if !success {
-        print("Could not open key-value storage file\n");
-        return "", false;
+        print("error creating new log file\n");
+        return false;
     }
+    log = *logs_list[new_log_index];
     
     // write to new file & load to hash_table
     for line: data.entries {
         if line.key == "" continue;
-        if load load_to_hash_table(line.key, line.value, file_length(new_file));
-        ok := write_key_value_pair_to_file(line.key, line.value, new_file);
-        if !ok return "", false;
+        if load load_to_hash_table(line.key, line.value, log);
+        ok := write_key_value_pair_to_file(line.key, line.value, log.file);
+        if !ok return false;
     }
     
-    file_close(*file);
-    file_close(*new_file);
+    file_close(*log.file);
     file_delete(file_path);
     
     // update_log_lists
     
-    return new_file_path, true;
+    return true;
 }
 
 parse_http_request :: (request: string) -> (bool, string) {
@@ -219,8 +265,8 @@ parse_http_request :: (request: string) -> (bool, string) {
         case "set";
             k_v := split(right, " ");
             if k_v.count != 2 return false, "Incorrect request format. Please use the format 'set KEY VALUE'.";
-            ok, value := handle_set(k_v[0], k_v[1]);
-            return ok, value;
+            ok := handle_set(k_v[0], k_v[1], *logs_list[current_log]);
+            return ok, "";
             
         case "get";                                
             k_v := split(right, " ");
@@ -243,53 +289,63 @@ write_key_value_pair_to_file :: (key: string, value: string, file: File) -> bool
     return true;
 }
 
-load_to_hash_table :: (key: string, value: string, advance: s64) {
+load_to_hash_table :: (key: string, value: string, log: Log) {
+    advance := file_length(log.file);
     offset := xx(advance + key.count + 1);
     
     offset_info: [2]u32;
     offset_info[0] = xx offset;
     offset_info[1] = xx value.count;
-    table_set(*indexes, copy_string(key), offset_info);
+    table_set(*log.indexes, copy_string(key), offset_info);
 }
 
-handle_set :: (key: string, value: string) -> (bool, string) {
-    load_to_hash_table(key, value, file_length(file));
-    ok := write_key_value_pair_to_file(key, value, file);
-    if !ok return false, "";
-    return true, "";
+handle_set :: (key: string, value: string, log: *Log) -> bool {
+    load_to_hash_table(key, value, <<log);
+    ok := write_key_value_pair_to_file(key, value, log.file);    
+    if !ok return false;
+    return true;
 }
 
 handle_get :: (key: string) -> (bool, string) {
-    offset, ok := table_find(*indexes, key);
-    advance, length := offset[0], offset[1];
-    value := "no value";
-    if !ok return true, value;
-    
-    buffer := cast(*u8) alloc(length); // Free!
-    value.count = length;
-    value.data = buffer;
+    for < logs_list.count-1..0 {
+        log := logs_list[it];    
+        offset, ok := table_find(*log.indexes, key);
+        if !ok continue;
         
-    file_set_position(file, advance);
-    success :=  file_read(file, buffer, length);
-    if !success {
-        print("Could not read from key-value storage file.\n");
-        return false, "";
+        advance, length := offset[0], offset[1];
+        
+        buffer := cast(*u8) alloc(length); // Free!
+        value: string;
+        value.count = length;
+        value.data = buffer;
+            
+        file_set_position(log.file, advance);
+        success :=  file_read(log.file, buffer, length);
+        if !success {
+            print("Could not read from key-value storage file.\n");
+            return false, "no value";
+        }
+        return true, value;
     }
-    return true, value;
+    
+    return false, "no value";
 }
 
-indexes: Table(string, [2]u32);
-file: File;
 
-logs_list: [..]Log;
-logs_dir : string;
 Log :: struct {
+    indexes: Table(string, [2]u32);
     name: string;
+    file: File;
     modification_time: Apollo_Time;
 }
+logs_list: [..]Log;
+current_log: int;
+logs_dir : string;
+
 
 DEFAULT_PORT :: "27015";
 DEFAULT_BUFLEN :: 1024;
+SEGMENT_SIZE :: 32;
 
 #import "Basic";
 #import "Socket";
