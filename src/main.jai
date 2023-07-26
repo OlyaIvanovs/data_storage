@@ -7,15 +7,14 @@ main :: () {
     
     make_directory_if_it_does_not_exist(logs_dir);
     timestamp := to_nanoseconds(current_time_consensus());
-    if !dir_existed then write_entire_file(tprint("%/%.kv", logs_dir, timestamp), "");
+    if !dir_existed then write_entire_file(tprint("%/%", logs_dir, timestamp), "");
     
     update_logs_list();
-    // Load data from logs to hash table
-    for 0..logs_list.count-1 {
+    // Load data from logs to hash tables. Do not compact newly created file
+    for 1..logs_list.count-1 {
         success = compaction_file(*logs_list[it], load=true);
         if !success return;
     }
-    update_logs_list();
     
     // Merge segments !
     // if log_list.count > 2 {
@@ -23,11 +22,12 @@ main :: () {
     // }
     
     current_log = logs_list.count - 1; // the newest
-    logs_list[current_log].file, success = file_open(logs_list[current_log].name, for_writing=true, keep_existing_content=true);
-    if !success {
-        print("Could not open key-value storage file\n");
-        return;
-    }
+   
+    // Start thread for compaction of key-value update log, retaining only the most recent value for each key
+    compaction_thread_group = Thread_Group.{};
+    init(*compaction_thread_group, 1, compaction_proc);
+    compaction_thread_group.name = "Compaction";
+    start(*compaction_thread_group);
     
     wsa_data : WSAData;
     
@@ -101,6 +101,14 @@ main :: () {
             str.data = recvbuf.data;
             str.count = read;
             
+            // check thread results
+            results := get_completed_work(*compaction_thread_group);
+            print("results %\n",results);
+            for results {
+                compaction := cast(*Compaction)it;
+                print("Result %\n", compaction.output_sum);
+            }
+            
             ok, res := parse_http_request(str);
             if !ok {
                 print("wrong request format\n");
@@ -124,22 +132,17 @@ main :: () {
             print("recv failed %\n", WSAGetLastError());
         }
         closesocket(client_socket);
-        
-        // Check if main file is too big Add thread for that
-        file_modified_time,file_size, ok := file_modtime_and_size(logs_list[current_log].name); 
-        if file_size > SEGMENT_SIZE {
-            print("new file\n");
-            current_log, success = create_new_log();
-            if !success {
-                print("error creating file\n");
-                return;
-            }
-            // close overloaded file ?
-        }
     }
         
     // Close
     closesocket(listen_socket);
+    if compaction_thread_group.initted then shutdown(*compaction_thread_group);
+}
+
+compaction_proc :: (group: *Thread_Group, thread: *Thread, work: *void) -> Thread_Continue_Status {
+    compaction := cast(*Compaction) work;        
+    compaction_file(*logs_list[compaction.log_index], load=true);
+    return .CONTINUE;
 }
 
 create_new_log :: () -> (int, bool) {
@@ -147,14 +150,25 @@ create_new_log :: () -> (int, bool) {
     success: bool;
     log.modification_time = current_time_consensus();
     timestamp := to_nanoseconds(log.modification_time);
-    log.name = sprint("%/%.kv", logs_dir, timestamp);
-    log.file, success = file_open(log.name, for_writing=true, keep_existing_content=true);
-    if !success {
-        print("Could not open key-value storage file\n");
-        return -1, false;
-    }
+    log.name = sprint("%/%", logs_dir, timestamp);
+    
    array_add(*logs_list, log);
    return logs_list.count-1, true;
+}
+
+maybe_create_new_file :: (file_name: string) -> (int, bool) {
+    file_modified_time,file_size, ok := file_modtime_and_size(file_name); 
+    if file_size > SEGMENT_SIZE {
+        print("new file\n");
+        success: bool;
+        current_log, success = create_new_log();
+        if !success {
+            print("error creating file\n");
+            return -1, false;
+        }
+        return current_log, true;
+    }
+    return -1, false;
 }
 
 merge_segments :: (file_path_1: string, file_path_2: string) -> (string, bool) {
@@ -162,7 +176,6 @@ merge_segments :: (file_path_1: string, file_path_2: string) -> (string, bool) {
     
     upload_to_data_table :: (file_path: string, data: Table) -> bool {
         file_contents_str, ok := read_entire_file(file_path);
-        print("file_contents_str %\n", file_contents_str);
         if !ok return false;
         
         k_v_list := split(file_contents_str, ";");
@@ -178,12 +191,7 @@ merge_segments :: (file_path_1: string, file_path_2: string) -> (string, bool) {
     upload_to_data_table(file_path_2, data);
     
     timestamp := to_nanoseconds(current_time_consensus());
-    new_file_path := sprint("%/%.kv", logs_dir, timestamp);
-    new_file, success :=  file_open(new_file_path, for_writing=true, keep_existing_content=true);
-    if !success {
-        print("Could not open key-value storage file\n");
-        return "", false;
-    } 
+    new_file_path := sprint("%/%", logs_dir, timestamp);
     return new_file_path, true;
 }
 
@@ -191,13 +199,7 @@ update_logs_list :: () {
     array_reset_keeping_memory(*logs_list);
     
     maybe_add_to_logs_list :: (file_info: *File_Visit_Info, userdata: *void) {
-        file, success := file_open(file_info.full_name);
-        if !success {
-            print("Could not open new key-value storage file %\n", file_info.full_name);
-            return;
-        }
-        file_close(*file);
-        log := Log.{name=copy_string(file_info.full_name), modification_time=file_info.modification_time, file=file};
+        log := Log.{name=copy_string(file_info.full_name), modification_time=file_info.modification_time};
         array_add(*logs_list, log);
     }
     visit_files(logs_dir, recursive = false, null, maybe_add_to_logs_list, visit_directories = false);
@@ -214,8 +216,15 @@ update_logs_list :: () {
 compaction_file :: (log: *Log, load: bool = false) -> bool {
     data: Table(string, string);
     file_path := log.name;
+    
+    f, ok2 := file_open(file_path);
+    if !ok2 {
+        print("Compaction: Could not open key-value storage file\n");
+        return false;
+    }
     file_contents_str, ok := read_entire_file(file_path);
     if !ok return  false;
+    file_close(*f);
     
     k_v_list := split(file_contents_str, ";");
     for k_v: k_v_list {
@@ -223,32 +232,28 @@ compaction_file :: (log: *Log, load: bool = false) -> bool {
         table_set(*data, copy_string(key), copy_string(value));
     }
     
-    new_log_index, success := create_new_log();
-    if !success {
-        print("error creating new log file\n");
-        return false;
-    }
-    log = *logs_list[new_log_index];
-    
-    // write to new file & load to hash_table
+    left, right : string;
+    timestamp: int;
+    ok, left, right = split_from_right(file_path, "/");
+    timestamp, ok = string_to_int(right);
+    new_log_name := sprint("%/%", logs_dir, timestamp+1);
+        
+    table_reset(*log.indexes);
     for line: data.entries {
         if line.key == "" continue;
-        if load load_to_hash_table(line.key, line.value, log);
-        ok := write_key_value_pair_to_file(line.key, line.value, log.file);
+        if load load_to_hash_table(line.key, line.value, log, new_log_name);
+        ok := write_key_value_pair_to_file(line.key, line.value, new_log_name);
         if !ok return false;
     }
-    
-    file_close(*log.file);
-    file_delete(file_path);
-    
-    // update_log_lists
-    
+    log.name = new_log_name; 
+    // log.modification_time = current_time_consensus();
+    file_delete(file_path);  
     return true;
 }
 
 parse_http_request :: (request: string) -> (bool, string) {
     ok, method, right := split_from_left(request, " ");
-    if method != "POST" return false, "Wrond method. Should be POST.";
+    if method != "POST" return false, "Wrong method. Should be POST.";
     
     left: string;
     ok, left, right = split_from_left(request, "Content-Type: ");
@@ -273,11 +278,32 @@ parse_http_request :: (request: string) -> (bool, string) {
             if k_v.count != 1 return false, "Incorrect request format. Please use the format 'get KEY'.";
             ok, value := handle_get(k_v[0]);
             return ok, value;
+            
+        case "cat";
+            for logs_list {
+                f, ok := file_open(it.name);
+                if !ok {
+                    print("Cat: Could not open key-value storage file\n");
+                    return false, "";
+                }
+                file_contents_str, ok2 := read_entire_file(it.name);
+                if !ok2 return  false, "";
+                print("%\n", file_contents_str);
+                file_close(*f);
+            }
+            return true, "file";
     }
     return false, "";
 }
 
-write_key_value_pair_to_file :: (key: string, value: string, file: File) -> bool{
+write_key_value_pair_to_file :: (key: string, value: string, file_path: string) -> bool{
+    file, ok := file_open(file_path, for_writing=true, keep_existing_content=true);
+    if !ok {
+        print("Open file to write: Could not open key-value storage file\n");
+        return false;
+    }
+    defer file_close(*file);
+    
     data := tprint("%:%;", key, value);
     advance :=  file_length(file);
     file_set_position(file, advance);
@@ -289,8 +315,13 @@ write_key_value_pair_to_file :: (key: string, value: string, file: File) -> bool
     return true;
 }
 
-load_to_hash_table :: (key: string, value: string, log: Log) {
-    advance := file_length(log.file);
+load_to_hash_table :: (key: string, value: string, log: Log, file_path: string) {
+    file, ok := file_open(file_path, for_writing=true, keep_existing_content=true);
+    if !ok {
+        print("Open file to write: Could not open key-value storage file\n");
+    }
+    advance := file_length(file);
+    file_close(*file);
     offset := xx(advance + key.count + 1);
     
     offset_info: [2]u32;
@@ -300,9 +331,19 @@ load_to_hash_table :: (key: string, value: string, log: Log) {
 }
 
 handle_set :: (key: string, value: string, log: *Log) -> bool {
-    load_to_hash_table(key, value, <<log);
-    ok := write_key_value_pair_to_file(key, value, log.file);    
+    load_to_hash_table(key, value, <<log, log.name);
+    ok := write_key_value_pair_to_file(key, value, log.name);    
     if !ok return false;
+    // if current file is too big, create a new one
+    index, success := maybe_create_new_file(log.name);
+    if success {
+        // Give the thread group compaction work
+        work := New(Compaction);
+        work.log_index = index-1;
+        work.input_number = 10;
+        add_work(*compaction_thread_group, work, tprint("Work item %", work));
+        current_log = index;
+    }
     return true;
 }
 
@@ -311,31 +352,44 @@ handle_get :: (key: string) -> (bool, string) {
         log := logs_list[it];    
         offset, ok := table_find(*log.indexes, key);
         if !ok continue;
-        
+                
         advance, length := offset[0], offset[1];
         
         buffer := cast(*u8) alloc(length); // Free!
         value: string;
         value.count = length;
         value.data = buffer;
-            
-        file_set_position(log.file, advance);
-        success :=  file_read(log.file, buffer, length);
+        
+        file, ok2 := file_open(log.name, for_writing=true, keep_existing_content=true);
+        if !ok2 {
+            print("Write to file: Could not open key-value storage file\n");
+            return false, "";
+        }
+        defer file_close(*file);
+    
+        file_set_position(file, advance);     
+        success, bytes :=  file_read(file, buffer, length);
         if !success {
             print("Could not read from key-value storage file.\n");
             return false, "no value";
         }
         return true, value;
-    }
-    
+    } 
     return false, "no value";
 }
+
+Compaction :: struct {
+    log_index: int;
+
+    input_number: u64; 
+    output_sum:   u64;
+}
+compaction_thread_group: Thread_Group;
 
 
 Log :: struct {
     indexes: Table(string, [2]u32);
     name: string;
-    file: File;
     modification_time: Apollo_Time;
 }
 logs_list: [..]Log;
@@ -355,6 +409,7 @@ SEGMENT_SIZE :: 32;
 #import "File_Utilities";
 #import "System";
 #import "Sort";
+#import "Thread";
 
 
 
