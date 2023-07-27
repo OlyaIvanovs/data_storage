@@ -101,14 +101,6 @@ main :: () {
             str.data = recvbuf.data;
             str.count = read;
             
-            // check thread results
-            results := get_completed_work(*compaction_thread_group);
-            print("results %\n",results);
-            for results {
-                compaction := cast(*Compaction)it;
-                print("Result %\n", compaction.output_sum);
-            }
-            
             ok, res := parse_http_request(str);
             if !ok {
                 print("wrong request format\n");
@@ -126,6 +118,7 @@ main :: () {
             if write == SOCKET_ERROR {
                 print("send failed %\n", WSAGetLastError());
             }
+            free(res);
         } else if read == 0 {
             print("Connection closing.. \n");
         } else {
@@ -151,9 +144,8 @@ create_new_log :: () -> (int, bool) {
     log.modification_time = current_time_consensus();
     timestamp := to_nanoseconds(log.modification_time);
     log.name = sprint("%/%", logs_dir, timestamp);
-    
-   array_add(*logs_list, log);
-   return logs_list.count-1, true;
+    array_add(*logs_list, log);
+    return logs_list.count-1, true;
 }
 
 maybe_create_new_file :: (file_name: string) -> (int, bool) {
@@ -268,6 +260,7 @@ parse_http_request :: (request: string) -> (bool, string) {
     if instruction == {
     
         case "set";
+            print("SET logs.list count %\n", logs_list.count);
             k_v := split(right, " ");
             if k_v.count != 2 return false, "Incorrect request format. Please use the format 'set KEY VALUE'.";
             ok := handle_set(k_v[0], k_v[1], *logs_list[current_log]);
@@ -280,18 +273,21 @@ parse_http_request :: (request: string) -> (bool, string) {
             return ok, value;
             
         case "cat";
+            result: String_Builder;
+            init_string_builder(*result);
             for logs_list {
-                f, ok := file_open(it.name);
+                f, ok := file_open(it.name, for_writing=true, keep_existing_content=true);
                 if !ok {
                     print("Cat: Could not open key-value storage file\n");
                     return false, "";
                 }
                 file_contents_str, ok2 := read_entire_file(it.name);
                 if !ok2 return  false, "";
-                print("%\n", file_contents_str);
+                print_to_builder(*result, file_contents_str);
                 file_close(*f);
             }
-            return true, "file";
+            str := builder_to_string(*result);
+            return true, str;
     }
     return false, "";
 }
